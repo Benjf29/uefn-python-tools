@@ -111,13 +111,9 @@ except SystemExit:
 
 if not _needs_restart:
     import ctypes
-    import json
     import os
     import re
-    import shutil
     import struct
-    import subprocess
-    import time
     import uuid
 
     import unreal
@@ -127,8 +123,8 @@ if not _needs_restart:
         QHeaderView, QTextEdit, QSplitter, QComboBox, QAbstractItemView,
         QGroupBox, QTabWidget, QSpinBox, QMessageBox, QAbstractSpinBox,
     )
-    from PySide6.QtCore import Qt, QPointF
-    from PySide6.QtGui import QColor, QPainter, QPen
+    from PySide6.QtCore import Qt, QPointF, QRectF
+    from PySide6.QtGui import QColor, QPainter, QPen, QFont
 
     # ═══════════════════════════════════════════════════════════════════════
     #  STYLE  (UE5 Slate palette)
@@ -280,6 +276,80 @@ if not _needs_restart:
                             QPointF(cx + 4, cy - 2)])
             p.end()
 
+    # Sort states for SortHeader, cycled in this order.
+    SORT_NONE, SORT_ASC, SORT_DESC = 0, 1, 2
+
+    class SortHeader(QHeaderView):
+        """Header that PAINTS a 3-state sort indicator on one column.
+
+        Clicking the column cycles neutral -> A-Z -> Z-A -> neutral and invokes
+        `on_change(state)`, which must re-sort the table's BACKING LIST. Qt's own
+        setSortingEnabled() only reorders the view, which would desync the
+        row->field mapping that binding and deletion rely on.
+
+        Like ArrowCombo, the glyph is painted rather than styled: this Qt build
+        does not render CSS/image arrows on header subcontrols.
+        """
+        def __init__(self, column, on_change, parent=None):
+            super().__init__(Qt.Orientation.Horizontal, parent)
+            self._column = column
+            self._on_change = on_change
+            self.state = SORT_NONE
+            self.setSectionsClickable(True)
+            self.sectionClicked.connect(self._clicked)
+
+        def _clicked(self, index):
+            if index != self._column:
+                return
+            self.state = (self.state + 1) % 3
+            self._on_change(self.state)
+            self.viewport().update()
+
+        def reset_state(self):
+            """Return to neutral without firing the callback (e.g. on reload)."""
+            self.state = SORT_NONE
+            self.viewport().update()
+
+        def paintSection(self, painter, rect, index):
+            super().paintSection(painter, rect, index)
+            if index != self._column:
+                return
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            active = self.state != SORT_NONE
+            color = QColor(C_ACC if active else C_TX2)
+            # Classic A-over-Z sort glyph + a direction arrow, pinned to the far
+            # right of the section. Z-A flips the letters to Z-over-A. Painted
+            # (not styled) so it renders on this Qt build.
+            arrow_x = rect.right() - 11
+            letters_cx = arrow_x - 11
+            cy = rect.center().y()
+
+            # Stacked letters
+            top, bot = ("Z", "A") if self.state == SORT_DESC else ("A", "Z")
+            f = QFont(self.font())
+            f.setPixelSize(9)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(color)
+            painter.drawText(QRectF(letters_cx - 6, cy - 10, 12, 10),
+                             Qt.AlignmentFlag.AlignCenter, top)
+            painter.drawText(QRectF(letters_cx - 6, cy, 12, 10),
+                             Qt.AlignmentFlag.AlignCenter, bot)
+
+            # Down arrow (shaft + head) beside the letters
+            pen = QPen(color)
+            pen.setWidthF(1.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(arrow_x, cy - 6), QPointF(arrow_x, cy + 6))
+            painter.drawPolyline([QPointF(arrow_x - 3, cy + 2),
+                                  QPointF(arrow_x, cy + 6),
+                                  QPointF(arrow_x + 3, cy + 2)])
+            painter.restore()
+
     # ═══════════════════════════════════════════════════════════════════════
     #  LOGIC  (no UI — every call verified against a live widget)
     # ═══════════════════════════════════════════════════════════════════════
@@ -291,7 +361,6 @@ if not _needs_restart:
     _VERSE_TYPE = {
         "Boolean": "logic", "Integer": "int", "Floating": "float",
         "String": "string", "Message": "message",
-        "Event": "event",
         "Asset": "asset",       # refined to material/texture via TypeUE5Class
         "Structure": "struct",  # refined to color/color_alpha via TypeUE5Class
     }
@@ -445,11 +514,7 @@ if not _needs_restart:
             elif kind == "asset":
                 kind = "texture" if "Texture2D" in ue5_class else "material"
             try:
-                # Event fields have a public Verse name but their Blueprint member
-                # is named VerseFieldInternalVariable_<public name>.
-                member_name = ("VerseFieldInternalVariable_" + name
-                               if kind == "event" else name)
-                category = str(_bel.get_blueprint_variable_category(wbp, member_name))
+                category = str(_bel.get_blueprint_variable_category(wbp, name))
             except Exception:
                 category = "Default"
             fields.append({"name": name, "type": kind,
@@ -466,8 +531,12 @@ if not _needs_restart:
         task.replace_identical = True
         task.prompt = False
         unreal.Exporter.run_asset_export_task(task)
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            text = handle.read()
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read()
+        if raw_bytes.startswith(b'\xff\xfe') or b'\x00' in raw_bytes[:100]:
+            text = raw_bytes.decode('utf-16le', errors='ignore')
+        else:
+            text = raw_bytes.decode('utf-8', errors='ignore')
         try:
             os.remove(path)
         except OSError:
@@ -768,396 +837,6 @@ if not _needs_restart:
         _el.save_asset(wbp_path)
         return result
 
-    # -------------------------------------------------------------------------
-    # VERSE EVENT FIELDS + MVVM EVENTS
-    # -------------------------------------------------------------------------
-
-    _UASSETGUI = r"C:\yourpath\UAssetGUI.exe"
-    _UASSET_VERSION = "VER_UE5_5"
-    _ZERO_GUID_BRACED = "{00000000-0000-0000-0000-000000000000}"
-
-    # Conservative list of delegates whose UEFN/UMG signatures are known to take
-    # no parameters. Reflected delegates not in this list are only accepted when
-    # they already occur in a compiler-authored MVVM event row on the same WBP.
-    _KNOWN_ZERO_ARG_DELEGATES = {
-        "OnClicked", "OnPressed", "OnReleased", "OnHovered", "OnUnhovered",
-        "OnButtonBaseClicked", "OnButtonClicked", "OnButtonPressed",
-        "OnButtonReleased", "OnButtonHovered", "OnButtonUnhovered",
-        "OnOpening", "OnClosing", "OnOpened", "OnClosed",
-    }
-
-    def _struct_text(value):
-        try:
-            return value.export_text()
-        except Exception:
-            return str(value)
-
-    def _event_path_parts(event_obj):
-        """Return (widget, delegate, destination) from an MVVM event object."""
-        try:
-            source = _struct_text(event_obj.get_editor_property("event_path"))
-            dest = _struct_text(event_obj.get_editor_property("destination_path"))
-        except Exception:
-            return None, None, None
-        widget = re.search(r'WidgetName="([^"]*)"', source)
-        delegate = re.search(r'MemberName="([^"]+)"', source)
-        destination = re.search(r'MemberName="([^"]+)"', dest)
-        return (widget.group(1) if widget else None,
-                delegate.group(1) if delegate else None,
-                destination.group(1) if destination else None)
-
-    def existing_event_bindings(wbp_path, include_objects=False):
-        """List current MVVM event rows without mutating the view."""
-        wbp = _el.load_asset(wbp_path)
-        subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
-        view = subsystem.get_view(wbp)
-        if view is None:
-            return []
-        rows = []
-        for event_obj in view.get_editor_property("events"):
-            widget, delegate, destination = _event_path_parts(event_obj)
-            row = {"widget": widget, "delegate": delegate,
-                   "destination": destination, "object_name": event_obj.get_name()}
-            if include_objects:
-                row["object"] = event_obj
-            rows.append(row)
-        return rows
-
-    def _snake_to_unreal(name):
-        return "".join(part[:1].upper() + part[1:] for part in name.split("_") if part)
-
-    def _is_multicast_delegate(value):
-        base = getattr(unreal, "MulticastDelegateBase", None)
-        if base is not None:
-            try:
-                return isinstance(value, base)
-            except TypeError:
-                pass
-        return "MulticastDelegate" in type(value).__name__
-
-    def _delegate_is_proven_zero_arg(value, public_name, compiler_proven):
-        if public_name in _KNOWN_ZERO_ARG_DELEGATES or public_name in compiler_proven:
-            return True
-        # Some generated delegate wrappers document broadcast() with its concrete
-        # signature. Accept only a positively empty signature; *args is ambiguous.
-        doc = (getattr(type(value), "__doc__", "") or "") + " " + \
-              (getattr(getattr(value, "broadcast", None), "__doc__", "") or "")
-        match = re.search(r'broadcast\(([^)]*)\)', doc, re.I)
-        if match:
-            args = match.group(1).replace("self", "").strip(" ,")
-            return not args
-        return False
-
-    def list_widget_event_targets(entries, existing_rows=None):
-        """Detect parameterless multicast delegates on widget instances.
-
-        Unknown signatures are deliberately excluded. Delegates already present
-        in compiler-authored MVVM rows are considered proven compatible.
-        """
-        existing_rows = existing_rows or []
-        compiler_proven = {r["delegate"] for r in existing_rows if r.get("delegate")}
-        class_by_widget = {}
-        targets, seen = [], set()
-        for class_path, widget_name in entries:
-            class_by_widget.setdefault(widget_name, class_path)
-            try:
-                cls = unreal.load_object(None, class_path)
-                cdo = unreal.get_default_object(cls) if cls else None
-            except Exception:
-                cdo = None
-            if cdo is None:
-                continue
-            for attr in dir(cdo):
-                if not attr.startswith("on_"):
-                    continue
-                try:
-                    value = cdo.get_editor_property(attr)
-                except Exception:
-                    continue
-                if not _is_multicast_delegate(value):
-                    continue
-                public_name = _snake_to_unreal(attr)
-                if not _delegate_is_proven_zero_arg(value, public_name, compiler_proven):
-                    continue
-                key = (widget_name, public_name)
-                if key in seen:
-                    continue
-                seen.add(key)
-                targets.append({"widget": widget_name, "delegate": public_name,
-                                "class_path": class_path})
-
-        # Preserve compiler-authored rows even if their generated widget class did
-        # not expose the delegate through Python reflection.
-        for row in existing_rows:
-            key = (row.get("widget"), row.get("delegate"))
-            if not all(key) or key in seen:
-                continue
-            seen.add(key)
-            targets.append({"widget": key[0], "delegate": key[1],
-                            "class_path": class_by_widget.get(key[0], "")})
-        return sorted(targets, key=lambda r: (r["widget"], r["delegate"]))
-
-    def _asset_filename(wbp_path):
-        package_name = wbp_path.split(".", 1)[0]
-        filename = str(unreal.PackageTools.package_name_to_filename(
-            package_name, extension=".uasset"))
-        if not os.path.isabs(filename):
-            filename = os.path.join(unreal.Paths.project_dir(), filename)
-        filename = os.path.normpath(filename)
-        if not os.path.isfile(filename):
-            raise RuntimeError("cannot resolve asset file: %s" % filename)
-        return filename
-
-    def _make_asset_backup(wbp_path):
-        source = _asset_filename(wbp_path)
-        backup_dir = os.path.join(unreal.Paths.project_saved_dir(),
-                                  "VerseBinderBackups")
-        os.makedirs(backup_dir, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        backup = os.path.join(
-            backup_dir, "%s_%s_%s.uasset" % (
-                os.path.splitext(os.path.basename(source))[0], stamp,
-                uuid.uuid4().hex[:8]))
-        shutil.copy2(source, backup)
-        return source, backup
-
-    def _close_and_unload(wbp_path):
-        asset = _el.load_asset(wbp_path)
-        if asset is None:
-            return
-        editor = unreal.get_editor_subsystem(unreal.AssetEditorSubsystem)
-        editor.close_all_editors_for_asset(asset)
-        package = _el.get_package_for_object(asset)
-        asset = None
-        unreal.EditorLoadingAndSavingUtils.unload_packages([package])
-        unreal.SystemLibrary.collect_garbage()
-
-    def _reload_compile_save(wbp_path):
-        asset = _el.load_asset(wbp_path)
-        if asset is None:
-            raise RuntimeError("asset did not reload after disk patch")
-        package = _el.get_package_for_object(asset)
-        unreal.EditorLoadingAndSavingUtils.reload_packages([package])
-        asset = _el.load_asset(wbp_path)
-        _bel.compile_blueprint(asset)
-        _el.save_asset(wbp_path)
-
-    def _run_uassetgui(*args):
-        if not os.path.isfile(_UASSETGUI):
-            raise RuntimeError("UAssetGUI.exe not found: %s" % _UASSETGUI)
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.run([_UASSETGUI] + list(args), capture_output=True,
-                              text=True, creationflags=flags)
-        if proc.returncode:
-            raise RuntimeError("UAssetGUI failed: %s" %
-                               ((proc.stderr or proc.stdout or "unknown error").strip(),))
-
-    def _json_named(node, name, recursive=True):
-        found = []
-        if isinstance(node, dict):
-            if node.get("Name") == name:
-                found.append(node)
-                if not recursive:
-                    return found
-            for value in node.values():
-                found.extend(_json_named(value, name, recursive))
-        elif isinstance(node, list):
-            for value in node:
-                found.extend(_json_named(value, name, recursive))
-        return found
-
-    def _set_first_named_value(node, name, value):
-        matches = _json_named(node, name)
-        if not matches:
-            raise RuntimeError("event JSON is missing %s" % name)
-        matches[-1]["Value"] = value
-
-    def _set_property_path(event_export, path_name, member_name,
-                           widget_name, source_name, self_context):
-        paths = [p for p in event_export.get("Data", []) if p.get("Name") == path_name]
-        if not paths:
-            raise RuntimeError("%s has no %s" % (event_export.get("ObjectName"), path_name))
-        path = paths[0]
-        _set_first_named_value(path, "MemberName", member_name)
-        for guid in _json_named(path, "MemberGuid"):
-            if isinstance(guid.get("Value"), str):
-                guid["Value"] = _ZERO_GUID_BRACED
-        _set_first_named_value(path, "bSelfContext", bool(self_context))
-        widget_nodes = _json_named(path, "WidgetName")
-        if widget_nodes:
-            widget_nodes[-1]["Value"] = widget_name
-        _set_first_named_value(path, "Source", source_name)
-
-    def _patch_event_json(document, operations):
-        exports = document.get("Exports", [])
-        by_name = {e.get("ObjectName"): e for e in exports}
-        event_exports = [e for e in exports
-                         if str(e.get("ObjectName", "")).startswith(
-                             "MVVMBlueprintViewEvent_")]
-        indexes = []
-        for event_export in event_exports:
-            for node in _json_named(event_export, "Index"):
-                if isinstance(node.get("Value"), int):
-                    indexes.append(node["Value"])
-        next_index = max(indexes, default=-1) + 1
-
-        name_map = document.setdefault("NameMap", [])
-        for operation in operations:
-            event_export = by_name.get(operation["object_name"])
-            if event_export is None:
-                raise RuntimeError("event export not found: %s" % operation["object_name"])
-            _set_property_path(
-                event_export, "EventPath", operation["delegate"],
-                operation["widget"], "EMVVMBlueprintFieldPathSource::Widget", False)
-            _set_property_path(
-                event_export, "DestinationPath", operation["destination"], "",
-                "EMVVMBlueprintFieldPathSource::SelfContext", True)
-            if operation.get("new"):
-                graph_name = "__" + str(uuid.uuid4())
-                _set_first_named_value(event_export, "GraphName", graph_name)
-                index_nodes = _json_named(event_export, "Index")
-                if index_nodes:
-                    index_nodes[-1]["Value"] = next_index
-                    next_index += 1
-                additions = [graph_name]
-            else:
-                additions = []
-            additions.extend([operation["object_name"], operation["widget"],
-                              operation["delegate"], operation["destination"]])
-            for value in additions:
-                if value and value not in name_map:
-                    name_map.append(value)
-
-    def _verify_event_json(document, operations):
-        by_name = {e.get("ObjectName"): e for e in document.get("Exports", [])}
-        for operation in operations:
-            event_export = by_name.get(operation["object_name"])
-            if event_export is None:
-                return False
-            event_path = next((p for p in event_export.get("Data", [])
-                               if p.get("Name") == "EventPath"), None)
-            dest_path = next((p for p in event_export.get("Data", [])
-                              if p.get("Name") == "DestinationPath"), None)
-            event_members = [n.get("Value") for n in _json_named(event_path, "MemberName")]
-            event_widgets = [n.get("Value") for n in _json_named(event_path, "WidgetName")]
-            dest_members = [n.get("Value") for n in _json_named(dest_path, "MemberName")]
-            if (operation["delegate"] not in event_members
-                    or operation["widget"] not in event_widgets
-                    or operation["destination"] not in dest_members):
-                return False
-        return True
-
-    def apply_event_bindings(wbp_path, pairs, replace=True):
-        """Bind parameterless widget delegates to Verse event() fields.
-
-        `pairs` contains (destination_field, widget_name, delegate_name). Protected
-        MVVM paths are patched through a validated UAssetGUI JSON roundtrip.
-        """
-        event_fields = {f["name"] for f in list_verse_fields(wbp_path)
-                        if f["type"] == "event"}
-        existing = existing_event_bindings(wbp_path, include_objects=True)
-        occupied = {(r["widget"], r["delegate"]): r for r in existing
-                    if r["widget"] and r["delegate"]}
-        result = {"created": [], "replaced": [], "skipped": [], "backup": None}
-        planned = []
-        for destination, widget, delegate in pairs:
-            tag = (destination, widget, delegate)
-            if destination not in event_fields:
-                result["skipped"].append((tag, "destination is not a Verse event() field"))
-                continue
-            old = occupied.get((widget, delegate))
-            if old and old["destination"] == destination:
-                result["skipped"].append((tag, "already bound"))
-                continue
-            if old and not replace:
-                result["skipped"].append((tag, "widget event already bound"))
-                continue
-            planned.append({"destination": destination, "widget": widget,
-                            "delegate": delegate, "old": old})
-
-        if not planned:
-            return result
-
-        source_file, backup = _make_asset_backup(wbp_path)
-        result["backup"] = backup
-        temp_dir = os.path.join(unreal.Paths.project_saved_dir(), "VerseBinderTemp",
-                                uuid.uuid4().hex)
-        os.makedirs(temp_dir, exist_ok=True)
-        try:
-            wbp = _el.load_asset(wbp_path)
-            subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
-            operations = []
-            for item in planned:
-                if item["old"]:
-                    object_name = item["old"]["object_name"]
-                    is_new = False
-                    result["replaced"].append(
-                        (item["destination"], item["widget"], item["delegate"]))
-                else:
-                    shell = subsystem.add_event(wbp)
-                    object_name = shell.get_name()
-                    is_new = True
-                    result["created"].append(
-                        (item["destination"], item["widget"], item["delegate"]))
-                operations.append({"object_name": object_name, "new": is_new,
-                                   "destination": item["destination"],
-                                   "widget": item["widget"],
-                                   "delegate": item["delegate"]})
-            _bel.compile_blueprint(wbp)
-            _el.save_asset(wbp_path)
-            wbp = None
-
-            _close_and_unload(wbp_path)
-            source_json = os.path.join(temp_dir, "source.json")
-            patched_json = os.path.join(temp_dir, "patched.json")
-            patched_asset = os.path.join(temp_dir, "patched.uasset")
-            roundtrip_json = os.path.join(temp_dir, "roundtrip.json")
-            _run_uassetgui("tojson", source_file, source_json, _UASSET_VERSION)
-            with open(source_json, "r", encoding="utf-8") as handle:
-                document = json.load(handle)
-            _patch_event_json(document, operations)
-            with open(patched_json, "w", encoding="utf-8") as handle:
-                json.dump(document, handle, ensure_ascii=False, indent=2)
-            _run_uassetgui("fromjson", patched_json, patched_asset, _UASSET_VERSION)
-            _run_uassetgui("tojson", patched_asset, roundtrip_json, _UASSET_VERSION)
-            with open(roundtrip_json, "r", encoding="utf-8") as handle:
-                roundtrip = json.load(handle)
-            if not _verify_event_json(roundtrip, operations):
-                raise RuntimeError("event paths did not survive UAssetGUI roundtrip")
-            shutil.copy2(patched_asset, source_file)
-            _reload_compile_save(wbp_path)
-            return result
-        except Exception as exc:
-            try:
-                _close_and_unload(wbp_path)
-                shutil.copy2(backup, source_file)
-                _reload_compile_save(wbp_path)
-            except Exception as rollback_exc:
-                raise RuntimeError("%s; rollback also failed: %s; backup: %s"
-                                   % (exc, rollback_exc, backup))
-            raise RuntimeError("%s (original restored; backup: %s)" % (exc, backup))
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def remove_event_bindings(wbp_path, widget_delegate_pairs=None,
-                              destinations=None):
-        pairs = set(widget_delegate_pairs or [])
-        destinations = set(destinations or [])
-        rows = existing_event_bindings(wbp_path, include_objects=True)
-        doomed = [r for r in rows
-                  if ((r["widget"], r["delegate"]) in pairs
-                      or r["destination"] in destinations)]
-        if not doomed:
-            return {"removed": 0, "backup": None}
-        _source, backup = _make_asset_backup(wbp_path)
-        wbp = _el.load_asset(wbp_path)
-        subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
-        for row in doomed:
-            subsystem.remove_event(wbp, row["object"])
-        _bel.compile_blueprint(wbp)
-        _el.save_asset(wbp_path)
-        return {"removed": len(doomed), "backup": backup}
-
     def remove_bindings(wbp_path, destinations):
         """Delete bindings by [(widget, prop)].
 
@@ -1319,7 +998,6 @@ if not _needs_restart:
     _METADATA_OFFSET = 200
     _ENTRY_SIZE = 32
     _VERSE_PROPERTY_FLAGS = 65541
-    _VERSE_EVENT_PROPERTY_FLAGS = 65557
     _NEWVARS_SEARCH_LIMIT = 1400
 
     _COLOR_STRUCT = ("/Script/CoreUObject.VerseStruct"
@@ -1327,12 +1005,7 @@ if not _needs_restart:
     _COLOR_ALPHA_STRUCT = ("/Script/CoreUObject.VerseStruct"
                            "'/VerseColors/_Verse/VNI/VerseColors.Colors_color_alpha'")
 
-    _VERSE_EVENT_CLASS = ("/Script/CoreUObject.Class"
-                          "'/Script/VerseTypeEditorRuntime.VerseEvent'")
-    _VERSE_UI_WIDGET_CLASS = ("/Script/CoreUObject.Class"
-                              "'/Script/VerseUI.VerseUIUserWidget'")
-
-    _CREATE_TYPES = ("logic", "int", "float", "string", "message", "event",
+    _CREATE_TYPES = ("logic", "int", "float", "string", "message",
                      "color", "color_alpha", "material", "texture")
 
     # ctypes buffers must outlive serialization or Unreal reads dangling pointers.
@@ -1365,9 +1038,7 @@ if not _needs_restart:
                 raise RuntimeError("basic type %r resolved to %r, expected %r"
                                    % (name, actual, expect))
             return pt
-        obj = {"event": ("object", _VERSE_EVENT_CLASS),
-               "back_pointer": ("object", _VERSE_UI_WIDGET_CLASS),
-               "color": ("struct", _COLOR_STRUCT),
+        obj = {"color": ("struct", _COLOR_STRUCT),
                "color_alpha": ("struct", _COLOR_ALPHA_STRUCT),
                "material": ("softobject", "/Script/CoreUObject.Class'/Script/Engine.MaterialInterface'"),
                "texture": ("softobject", "/Script/CoreUObject.Class'/Script/Engine.Texture2D'")}
@@ -1397,28 +1068,15 @@ if not _needs_restart:
         _KEEP.append(buf)
         return ctypes.addressof(buf), len(text) + 1
 
-    def _build_metadata_block(display_name, disable_default=False,
-                              visibility="<public>", event=False,
-                              hidden_only=False):
-        if hidden_only:
-            entries = [
-                (_fname_key16("DisplayName"), display_name),
-                (_fname_key16("Hidden"), None),
-            ]
-        else:
-            entries = [
-                (_fname_key16("FieldNotify"), None),
-                (_fname_key16("VerseVariable"), None),
-                (_fname_key16("DisplayName"), display_name),
-                (_fname_key16("VisibilityAccess"), visibility),
-            ]
-            if event:
-                entries.extend([
-                    (_fname_key16("Hidden"), None),
-                    (_fname_key16("EventParameters"), None),
-                ])
-            elif disable_default:                 # `message` fields only
-                entries.append((_fname_key16("DisableDefaultValue"), None))
+    def _build_metadata_block(display_name, disable_default, visibility="<public>"):
+        entries = [
+            (_fname_key16("FieldNotify"), None),
+            (_fname_key16("VerseVariable"), None),
+            (_fname_key16("DisplayName"), display_name),
+            (_fname_key16("VisibilityAccess"), visibility),
+        ]
+        if disable_default:                        # `message` fields only
+            entries.append((_fname_key16("DisableDefaultValue"), None))
         block = ctypes.create_string_buffer(len(entries) * _ENTRY_SIZE)
         _KEEP.append(block)
         base = ctypes.addressof(block)
@@ -1445,22 +1103,7 @@ if not _needs_restart:
                 return data, count
         raise RuntimeError("NewVariables array not found — descriptor layout changed")
 
-    def _event_function_graph_status(wbp, public_name):
-        """Return (graph, has_function_entry) for a public Verse event function."""
-        graph = _bel.find_graph(wbp, public_name)
-        if graph is None:
-            return None, False
-        try:
-            editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(
-                wbp, public_name)
-            entries = editor.list_nodes_of_class(unreal.K2Node_FunctionEntry)
-            has_entry = any(node.get_name() == "K2Node_FunctionEntry_0"
-                            for node in entries)
-        except Exception:
-            has_entry = False
-        return graph, has_entry
-
-    def _create_verse_fields_impl(wbp_path, fields, category=None):
+    def create_verse_fields(wbp_path, fields, category=None):
         """Create Verse fields. `fields` = [(name, kind)].
 
         Every created variable is patched into a real Verse field and verified
@@ -1470,54 +1113,17 @@ if not _needs_restart:
         """
         for name, kind in fields:
             _pin_type(kind)                        # validate all types up front
-            if kind == "event" and name.startswith("VerseFieldInternalVariable_"):
-                raise ValueError("event names must be public names, not internal names")
-            if name == "BackPointer":
-                raise ValueError("BackPointer is reserved by Verse UI event fields")
 
         wbp = _el.load_asset(wbp_path)
         existing = set(str(n) for n in _bel.list_member_variable_names(wbp))
-        public_existing = {f["name"] for f in list_verse_fields(wbp_path)}
 
-        # Preflight the whole batch before writing anything. An event's public
-        # function graph is a real Blueprint symbol and must not collide with an
-        # existing member/graph even though its storage member has an internal name.
-        # (public Verse name, actual Blueprint member name, kind)
-        specs, skipped = [], []
+        created, skipped = [], []
         for name, kind in fields:
-            actual = ("VerseFieldInternalVariable_" + name
-                      if kind == "event" else name)
-            if name in public_existing or actual in existing:
+            if name in existing:
                 skipped.append(name)
                 continue
-            specs.append((name, actual, kind))
-            if kind == "event":
-                graph, _has_entry = _event_function_graph_status(wbp, name)
-                if name in existing or graph is not None:
-                    raise ValueError(
-                        "event public name %r collides with an existing member or graph"
-                        % name)
-
-        for public, actual, kind in specs:
-            if not _bel.add_member_variable(wbp, actual, _pin_type(kind)):
-                raise RuntimeError("could not create Blueprint member %r" % actual)
-            existing.add(actual)
-            if kind == "event":
-                graph = _bel.add_function_graph(wbp, public)
-                if graph is None:
-                    raise RuntimeError(
-                        "could not create public event function graph %r" % public)
-
-        back_pointer_created = False
-        if any(kind == "event" for _public, _actual, kind in specs) \
-                and "BackPointer" not in existing:
-            if not _bel.add_member_variable(
-                    wbp, "BackPointer", _pin_type("back_pointer")):
-                raise RuntimeError("could not create shared BackPointer")
-            back_pointer_created = True
-            existing.add("BackPointer")
-
-        created = [public for public, _actual, _kind in specs]
+            _bel.add_member_variable(wbp, name, _pin_type(kind))
+            created.append(name)
 
         if not created:
             return {"created": [], "skipped_existing": skipped, "verified": {}}
@@ -1530,7 +1136,7 @@ if not _needs_restart:
         guids = variable_guids(wbp_path)
         wbp = _el.load_asset(wbp_path)
 
-        by_actual = {actual: (public, kind) for public, actual, kind in specs}
+        kinds = dict(fields)
         uobject = ctypes.c_uint64.from_address(id(wbp) + 16).value
         probe = next(iter(guids))
         data, count = _find_newvars(uobject, _guid_bytes(guids[probe]), len(guids))
@@ -1540,26 +1146,15 @@ if not _needs_restart:
             descriptor = data + index * _DESC_SIZE
             guid = bytes((ctypes.c_uint8 * 16).from_address(descriptor + _GUID_OFFSET))
             name = next((n for n, g in guids.items() if _guid_bytes(g) == guid), None)
-            if name == "BackPointer" and back_pointer_created:
-                block, entries = _build_metadata_block(
-                    "Back Pointer", hidden_only=True)
-                flags = _VERSE_PROPERTY_FLAGS
-                public_name = None
-            elif name in by_actual:
-                public_name, kind = by_actual[name]
-                block, entries = _build_metadata_block(
-                    public_name, disable_default=(kind == "message"),
-                    event=(kind == "event"))
-                flags = (_VERSE_EVENT_PROPERTY_FLAGS
-                         if kind == "event" else _VERSE_PROPERTY_FLAGS)
-            else:
+            if name not in created:
                 continue
+            block, entries = _build_metadata_block(name, kinds[name] == "message")
             ctypes.c_uint64.from_address(descriptor + _METADATA_OFFSET).value = block
             ctypes.c_uint32.from_address(descriptor + _METADATA_OFFSET + 8).value = entries
             ctypes.c_uint32.from_address(descriptor + _METADATA_OFFSET + 12).value = entries
-            ctypes.c_uint64.from_address(descriptor + _PROPERTY_FLAGS_OFFSET).value = flags
-            if public_name is not None:
-                patched.append(public_name)
+            ctypes.c_uint64.from_address(descriptor + _PROPERTY_FLAGS_OFFSET).value = \
+                _VERSE_PROPERTY_FLAGS
+            patched.append(name)
 
         missing = sorted(set(created) - set(patched))
         if missing:
@@ -1568,8 +1163,8 @@ if not _needs_restart:
                 "not Verse fields. Delete them before retrying." % (missing,))
 
         if category:
-            for _public, actual, _kind in specs:
-                _bel.set_blueprint_variable_category(wbp, actual, category)
+            for name in created:
+                _bel.set_blueprint_variable_category(wbp, name, category)
 
         _bel.compile_blueprint(wbp)
         _el.save_asset(wbp_path)
@@ -1578,107 +1173,22 @@ if not _needs_restart:
         asset = _el.find_asset_data(wbp_path)
         blob = str(asset.get_tag_value("VerseClassFields") or "")
         present = set(re.findall(r'\(Name="([^"]+)"', blob))
-        verified = {}
-        for public, actual, kind in specs:
-            if kind == "event":
-                pattern = (r'\(Name="%s",InternalName="%s".*?Type=Event,'
-                           % (re.escape(public), re.escape(actual)))
-                verified[public] = re.search(pattern, blob) is not None
-            else:
-                verified[public] = public in present
+        verified = {n: n in present for n in created}
         failed = [n for n, ok in verified.items() if not ok]
         if failed:
             raise RuntimeError("patched but absent from VerseClassFields: %r" % (failed,))
-
-        graph_failed = []
-        for public, _actual, kind in specs:
-            if kind != "event":
-                continue
-            _graph, has_entry = _event_function_graph_status(wbp, public)
-            if not has_entry:
-                graph_failed.append(public)
-        if graph_failed:
-            raise RuntimeError(
-                "event fields are missing public Function Graph entries: %r"
-                % graph_failed)
 
         # Mark as created-this-session — deleting these before an editor restart
         # would make the engine free our ctypes metadata buffers and crash.
         _CREATED_THIS_SESSION.update((wbp_path, n) for n in created)
 
-        return {"created": created, "skipped_existing": skipped,
-                "verified": verified,
-                "event_graphs_verified": [
-                    public for public, _actual, kind in specs if kind == "event"]}
-
-    def create_verse_fields(wbp_path, fields, category=None):
-        """Transactional wrapper around field + event Function Graph creation."""
-        wbp = _el.load_asset(wbp_path)
-        before_members = set(str(n) for n in _bel.list_member_variable_names(wbp))
-        before_graphs = {
-            name: _bel.find_graph(wbp, name) is not None
-            for name, kind in fields if kind == "event"
-        }
-        try:
-            return _create_verse_fields_impl(wbp_path, fields, category=category)
-        except Exception as original:
-            rollback_errors = []
-            try:
-                wbp = _el.load_asset(wbp_path)
-                actual_names = []
-                event_names = []
-                for public, kind in fields:
-                    actual = ("VerseFieldInternalVariable_" + public
-                              if kind == "event" else public)
-                    if actual not in before_members:
-                        actual_names.append(actual)
-                    if kind == "event" and not before_graphs.get(public, False):
-                        if _bel.find_graph(wbp, public) is not None:
-                            event_names.append(public)
-                if "BackPointer" not in before_members:
-                    current = set(str(n) for n in _bel.list_member_variable_names(wbp))
-                    if "BackPointer" in current:
-                        actual_names.append("BackPointer")
-
-                # Memory-patched metadata may point at ctypes-owned buffers. Null
-                # those arrays before variable destruction whenever descriptors are
-                # already serializable; a pre-compile failure simply skips this.
-                if actual_names:
-                    try:
-                        _detach_metadata_arrays(wbp, wbp_path, actual_names)
-                    except Exception as exc:
-                        rollback_errors.append("metadata detach: %s" % exc)
-                for public in event_names:
-                    try:
-                        _bel.remove_function_graph(wbp, public)
-                    except Exception as exc:
-                        rollback_errors.append("remove graph %s: %s" % (public, exc))
-                editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(
-                    wbp, "EventGraph")
-                current = set(str(n) for n in _bel.list_member_variable_names(wbp))
-                for actual in actual_names:
-                    if actual in current:
-                        try:
-                            editor.remove_member_variable(actual)
-                        except Exception as exc:
-                            rollback_errors.append(
-                                "remove member %s: %s" % (actual, exc))
-                _bel.compile_blueprint(wbp)
-                _el.save_asset(wbp_path)
-            except Exception as exc:
-                rollback_errors.append(str(exc))
-            detail = ("; rollback warnings: %s" % "; ".join(rollback_errors)
-                      if rollback_errors else "; partial creation rolled back")
-            raise RuntimeError("%s%s" % (original, detail)) from original
+        return {"created": created, "skipped_existing": skipped, "verified": verified}
 
     def set_fields_category(wbp_path, names, category):
         """Move member variables to `category` (public API), compile and save."""
         wbp = _el.load_asset(wbp_path)
-        kinds = {f["name"]: f["type"] for f in list_verse_fields(wbp_path)}
         for name in names:
-            actual = ("VerseFieldInternalVariable_" + name
-                      if kinds.get(name) == "event" else name)
-            _bel.set_blueprint_variable_category(wbp, actual, category)
+            _bel.set_blueprint_variable_category(wbp, name, category)
         _bel.compile_blueprint(wbp)
         _el.save_asset(wbp_path)
 
@@ -1729,28 +1239,15 @@ if not _needs_restart:
         if not names:
             return {"deleted": [], "failed": [], "bindings_dropped": 0}
 
-        field_types = {f["name"]: f["type"] for f in list_verse_fields(wbp_path)}
-        event_names = {n for n in names if field_types.get(n) == "event"}
-        event_result = remove_event_bindings(wbp_path, destinations=event_names)
-        actual_names = [("VerseFieldInternalVariable_" + n
-                         if field_types.get(n) == "event" else n)
-                        for n in names]
-
         wbp = _el.load_asset(wbp_path)
         # Detach BEFORE removal so the descriptor destructor frees nothing of ours.
-        _detach_metadata_arrays(wbp, wbp_path, actual_names)
-        graphs_removed = 0
-        for public_name in event_names:
-            if _bel.find_graph(wbp, public_name) is not None:
-                _bel.remove_function_graph(wbp, public_name)
-                graphs_removed += 1
+        _detach_metadata_arrays(wbp, wbp_path, names)
         editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(wbp, "EventGraph")
-        for public_name, actual_name in zip(names, actual_names):
-            editor.remove_member_variable(actual_name)
-            _CREATED_THIS_SESSION.discard((wbp_path, public_name))
-            _CREATED_THIS_SESSION.discard((wbp_path, actual_name))
+        for name in names:
+            editor.remove_member_variable(name)
+            _CREATED_THIS_SESSION.discard((wbp_path, name))
 
-        doomed = set(actual_names)
+        doomed = set(names)
         subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
         view = subsystem.get_view(wbp)
         dropped = 0
@@ -1769,13 +1266,9 @@ if not _needs_restart:
         _el.save_asset(wbp_path)
 
         remaining = set(str(n) for n in _bel.list_member_variable_names(wbp))
-        deleted, failed = [], []
-        for public_name, actual_name in zip(names, actual_names):
-            (deleted if actual_name not in remaining else failed).append(public_name)
-        return {"deleted": deleted, "failed": failed,
-                "bindings_dropped": dropped,
-                "events_dropped": event_result["removed"],
-                "event_graphs_removed": graphs_removed}
+        return {"deleted": [n for n in names if n not in remaining],
+                "failed": [n for n in names if n in remaining],
+                "bindings_dropped": dropped}
 
     def expand_batch_spec(spec, kind, start, count):
         """Expand a batch spec into [(name, kind)] pairs.
@@ -1807,7 +1300,6 @@ if not _needs_restart:
     _TYPE_COLOR = {
         "logic": "#ef3535", "int": "#1fe44b", "float": "#8bc24a",
         "string": "#ff5ecf", "message": "#ff8fd8",
-        "event": "#ffb800",
         "color": "#0e86ff", "color_alpha": "#0e86ff",
         "material": "#00d9d9", "texture": "#00d9d9",
     }
@@ -1827,14 +1319,12 @@ if not _needs_restart:
             self.resize(1080, 780)
             self._wbp_path = None
             self._fields = []
-            self._visible_fields = []   # _fields after the category filter
+            self._visible_fields = []   # _fields after the category filter + sort
+            self._manage_rows = []      # _fields after the Manage tab's sort
             self._widgets = []
             self._child_widgets = []
-            self._entries = []
             self._target_rows = []
             self._pending_pairs = []
-            self._event_targets = []
-            self._pending_event_pairs = []
             self._build_ui()
 
         def _build_ui(self):
@@ -1865,7 +1355,6 @@ if not _needs_restart:
             self.tabs = QTabWidget()
             outer.addWidget(self.tabs, 1)
             self.tabs.addTab(self._build_bind_tab(), "Bind")
-            self.tabs.addTab(self._build_events_tab(), "Events")
             self.tabs.addTab(self._build_create_tab(), "Create Fields")
             self.tabs.addTab(self._build_manage_tab(), "Manage Fields")
 
@@ -1894,6 +1383,8 @@ if not _needs_restart:
             self.tbl_fields = QTableWidget(0, 3)
             self.tbl_fields.setHorizontalHeaderLabels(["Field", "Type", "Category"])
             self._setup_table(self.tbl_fields, multi=True)
+            self.fields_sort = SortHeader(0, lambda _s: self._refresh_fields())
+            self.tbl_fields.setHorizontalHeader(self.fields_sort)
             self.tbl_fields.itemSelectionChanged.connect(self._refresh_targets)
             fl.addWidget(self.tbl_fields)
             upper_l.addWidget(fbox, 1)
@@ -1966,84 +1457,6 @@ if not _needs_restart:
             self._refresh_target_combo()
             self._log("Select a Widget Blueprint in the Content Browser, "
                       "then click From Selection.", C_TX2)
-            return tab
-
-        def _build_events_tab(self):
-            tab = QWidget()
-            root = QVBoxLayout(tab)
-            root.setContentsMargins(4, 6, 4, 4)
-            root.setSpacing(6)
-
-            upper = QWidget()
-            upper_l = QHBoxLayout(upper)
-            upper_l.setContentsMargins(0, 0, 0, 0)
-
-            fbox = QGroupBox("VERSE event() FIELDS   (multi-select for pairing)")
-            fl = QVBoxLayout(fbox)
-            self.tbl_event_fields = QTableWidget(0, 2)
-            self.tbl_event_fields.setHorizontalHeaderLabels(["Event field", "Category"])
-            self._setup_table(self.tbl_event_fields, multi=True)
-            fl.addWidget(self.tbl_event_fields)
-            upper_l.addWidget(fbox, 1)
-
-            tbox = QGroupBox("PARAMETERLESS WIDGET EVENTS")
-            tl = QVBoxLayout(tbox)
-            self.tbl_event_targets = QTableWidget(0, 4)
-            self.tbl_event_targets.setHorizontalHeaderLabels(
-                ["Widget", "Class", "Delegate", "Current destination"])
-            self._setup_table(self.tbl_event_targets, multi=True)
-            tl.addWidget(self.tbl_event_targets)
-            trow = QHBoxLayout()
-            btn_unbind = QPushButton("Unbind")
-            btn_unbind.clicked.connect(self._event_unbind_selected)
-            btn_pairs = QPushButton("Bind Selected Pairs")
-            btn_pairs.clicked.connect(self._event_bind_pairs)
-            btn_bind = QPushButton("Bind Selected")
-            btn_bind.setObjectName("btn_primary")
-            btn_bind.clicked.connect(self._event_bind_selected)
-            trow.addStretch(1)
-            trow.addWidget(btn_unbind)
-            trow.addWidget(btn_pairs)
-            trow.addWidget(btn_bind)
-            tl.addLayout(trow)
-            upper_l.addWidget(tbox, 2)
-            root.addWidget(upper, 1)
-
-            bulk = QGroupBox("BULK EVENT BIND BY NUMBER   (# = index)")
-            bl = QVBoxLayout(bulk)
-            brow = QHBoxLayout()
-            self.event_field_pattern = ArrowCombo()
-            self.event_field_pattern.setEditable(True)
-            self.event_field_pattern.lineEdit().setPlaceholderText("ItemClick_#")
-            self.event_widget_pattern = ArrowCombo()
-            self.event_widget_pattern.setEditable(True)
-            self.event_widget_pattern.lineEdit().setPlaceholderText("ItemButton_#")
-            self.event_delegate_combo = ArrowCombo()
-            brow.addWidget(QLabel("Field pattern:"))
-            brow.addWidget(self.event_field_pattern, 1)
-            brow.addWidget(QLabel("Widget pattern:"))
-            brow.addWidget(self.event_widget_pattern, 1)
-            brow.addWidget(QLabel("Delegate:"))
-            brow.addWidget(self.event_delegate_combo, 1)
-            bl.addLayout(brow)
-            brow2 = QHBoxLayout()
-            btn_preview = QPushButton("Preview Matches")
-            btn_preview.clicked.connect(self._event_preview_bulk)
-            self.btn_event_apply_bulk = QPushButton("Bind All")
-            self.btn_event_apply_bulk.setObjectName("btn_action")
-            self.btn_event_apply_bulk.setEnabled(False)
-            self.btn_event_apply_bulk.clicked.connect(self._event_apply_bulk)
-            brow2.addStretch(1)
-            brow2.addWidget(btn_preview)
-            brow2.addWidget(self.btn_event_apply_bulk)
-            bl.addLayout(brow2)
-            root.addWidget(bulk)
-
-            self.event_log = QTextEdit()
-            self.event_log.setReadOnly(True)
-            self.event_log.setMaximumHeight(150)
-            root.addWidget(self.event_log)
-            self._elog("Only proven parameterless delegates are shown.", C_TX2)
             return tab
 
         def _build_create_tab(self):
@@ -2120,6 +1533,8 @@ if not _needs_restart:
             gl = QVBoxLayout(box)
             self.tbl_manage = QTableWidget(0, 3)
             self.tbl_manage.setHorizontalHeaderLabels(["Field", "Type", "Category"])
+            self.manage_sort = SortHeader(0, lambda _s: self._refresh_manage())
+            self.tbl_manage.setHorizontalHeader(self.manage_sort)
             self._setup_table(self.tbl_manage, multi=True)
             gl.addWidget(self.tbl_manage)
 
@@ -2151,174 +1566,12 @@ if not _needs_restart:
             self.manage_log.append(
                 '<span style="color:%s">%s</span>' % (color, msg) if color else msg)
 
-        def _elog(self, msg, color=None):
-            self.event_log.append(
-                '<span style="color:%s">%s</span>' % (color, msg) if color else msg)
-            unreal.log("[VerseBinder Events] %s" % msg)
-            QApplication.processEvents()
-
-        def _selected_event_fields(self):
-            fields = [f for f in self._fields if f["type"] == "event"]
-            rows = self.tbl_event_fields.selectionModel().selectedRows()
-            return [fields[r.row()] for r in sorted(rows, key=lambda x: x.row())]
-
-        def _selected_event_targets(self):
-            rows = self.tbl_event_targets.selectionModel().selectedRows()
-            return [self._event_targets[r.row()]
-                    for r in sorted(rows, key=lambda x: x.row())]
-
-        @staticmethod
-        def _event_class_label(class_path):
-            bare = class_path.strip().strip("'")
-            return bare.rsplit(".", 1)[-1].rsplit("/", 1)[-1] or "?"
-
-        def _refresh_events(self):
-            event_fields = [f for f in self._fields if f["type"] == "event"]
-            self.tbl_event_fields.setRowCount(len(event_fields))
-            for row, field in enumerate(event_fields):
-                item = QTableWidgetItem(field["name"])
-                item.setForeground(QColor(_TYPE_COLOR["event"]))
-                self.tbl_event_fields.setItem(row, 0, item)
-                self.tbl_event_fields.setItem(
-                    row, 1, QTableWidgetItem(field.get("category", "Default")))
-            self._fit_columns(self.tbl_event_fields, stretch_col=0)
-
-            try:
-                existing = existing_event_bindings(self._wbp_path) if self._wbp_path else []
-                self._event_targets = list_widget_event_targets(self._entries, existing)
-            except Exception as exc:
-                self._event_targets = []
-                self._elog("Event detection failed: %s" % exc, C_ERR)
-                existing = []
-            bound = {(r["widget"], r["delegate"]): r["destination"]
-                     for r in existing if r["widget"] and r["delegate"]}
-            self.tbl_event_targets.setRowCount(len(self._event_targets))
-            for row, target in enumerate(self._event_targets):
-                current = bound.get((target["widget"], target["delegate"]))
-                self.tbl_event_targets.setItem(row, 0, QTableWidgetItem(target["widget"]))
-                self.tbl_event_targets.setItem(
-                    row, 1, QTableWidgetItem(self._event_class_label(
-                        target.get("class_path", ""))))
-                self.tbl_event_targets.setItem(row, 2, QTableWidgetItem(target["delegate"]))
-                current_item = QTableWidgetItem(current or "—")
-                current_item.setForeground(QColor(C_OK if current else C_TX2))
-                self.tbl_event_targets.setItem(row, 3, current_item)
-            self._fit_columns(self.tbl_event_targets, stretch_col=0)
-
-            self.event_field_pattern.clear()
-            for pattern, _count in detect_patterns([f["name"] for f in event_fields]):
-                self.event_field_pattern.addItem(pattern)
-            self.event_widget_pattern.clear()
-            for pattern, _count in detect_patterns(
-                    [t["widget"] for t in self._event_targets]):
-                self.event_widget_pattern.addItem(pattern)
-            self.event_delegate_combo.clear()
-            for name in sorted({t["delegate"] for t in self._event_targets}):
-                self.event_delegate_combo.addItem(name)
-
-        def _event_run_apply(self, pairs):
-            try:
-                result = apply_event_bindings(self._wbp_path, pairs, replace=True)
-            except Exception as exc:
-                self._elog("Event bind failed: %s" % exc, C_ERR)
-                return
-            for destination, widget, delegate in result["created"]:
-                self._elog("  created   %s.%s → %s" %
-                           (widget, delegate, destination), C_OK)
-            for destination, widget, delegate in result["replaced"]:
-                self._elog("  replaced  %s.%s → %s" %
-                           (widget, delegate, destination), C_OK)
-            for tag, reason in result["skipped"]:
-                self._elog("  skipped   %s.%s → %s (%s)" %
-                           (tag[1], tag[2], tag[0], reason), C_WARN)
-            if result.get("backup"):
-                self._elog("Backup: %s" % result["backup"], C_TX2)
-            self._load(self._wbp_path)
-
-        def _event_bind_selected(self):
-            fields = self._selected_event_fields()
-            targets = self._selected_event_targets()
-            if len(fields) != 1 or not targets:
-                self._elog("Select exactly one event field and one or more targets.", C_WARN)
-                return
-            self._event_run_apply([
-                (fields[0]["name"], t["widget"], t["delegate"]) for t in targets])
-
-        def _event_bind_pairs(self):
-            fields = self._selected_event_fields()
-            targets = self._selected_event_targets()
-            if not fields or len(fields) != len(targets):
-                self._elog("Select an equal number of event fields and targets.", C_WARN)
-                return
-            self._event_run_apply([
-                (f["name"], t["widget"], t["delegate"])
-                for f, t in zip(fields, targets)])
-
-        def _event_unbind_selected(self):
-            targets = self._selected_event_targets()
-            if not targets:
-                self._elog("Select widget event targets to unbind.", C_WARN)
-                return
-            try:
-                result = remove_event_bindings(
-                    self._wbp_path,
-                    widget_delegate_pairs=[(t["widget"], t["delegate"])
-                                           for t in targets])
-            except Exception as exc:
-                self._elog("Event unbind failed: %s" % exc, C_ERR)
-                return
-            self._elog("Removed %d event binding(s)." % result["removed"],
-                       C_OK if result["removed"] else C_WARN)
-            if result.get("backup"):
-                self._elog("Backup: %s" % result["backup"], C_TX2)
-            self._load(self._wbp_path)
-
-        @staticmethod
-        def _indexed_by_pattern(rows, pattern, key):
-            parts = _split_pattern(pattern)
-            if parts is None:
-                return {}
-            pre, post = parts
-            regex = re.compile(r"^%s(\d+)%s$" % (re.escape(pre), re.escape(post)))
-            result = {}
-            for row in rows:
-                match = regex.match(row[key])
-                if match:
-                    result[int(match.group(1))] = row
-            return result
-
-        def _event_preview_bulk(self):
-            fields = [f for f in self._fields if f["type"] == "event"]
-            field_map = self._indexed_by_pattern(
-                fields, self.event_field_pattern.currentText().strip(), "name")
-            targets = [t for t in self._event_targets
-                       if t["delegate"] == self.event_delegate_combo.currentText()]
-            target_map = self._indexed_by_pattern(
-                targets, self.event_widget_pattern.currentText().strip(), "widget")
-            self._pending_event_pairs = [
-                (field_map[index]["name"], target_map[index]["widget"],
-                 target_map[index]["delegate"])
-                for index in sorted(set(field_map) & set(target_map))]
-            self.event_log.clear()
-            for destination, widget, delegate in self._pending_event_pairs:
-                self._elog("  %s.%s → %s" % (widget, delegate, destination))
-            self.btn_event_apply_bulk.setEnabled(bool(self._pending_event_pairs))
-            if self._pending_event_pairs:
-                self._elog("%d event pair(s) ready." % len(self._pending_event_pairs), C_OK)
-            else:
-                self._elog("No matching event pairs.", C_WARN)
-
-        def _event_apply_bulk(self):
-            if not self._pending_event_pairs:
-                return
-            pairs = list(self._pending_event_pairs)
-            self._pending_event_pairs = []
-            self.btn_event_apply_bulk.setEnabled(False)
-            self._event_run_apply(pairs)
-
         def _refresh_manage(self):
-            self.tbl_manage.setRowCount(len(self._fields))
-            for r, field in enumerate(self._fields):
+            # Rows map to _manage_rows, not _fields — the sort may reorder them.
+            self._manage_rows = self._apply_sort(
+                list(self._fields), self.manage_sort.state)
+            self.tbl_manage.setRowCount(len(self._manage_rows))
+            for r, field in enumerate(self._manage_rows):
                 self.tbl_manage.setItem(r, 0, QTableWidgetItem(field["name"]))
                 type_item = QTableWidgetItem(field["type"])
                 type_item.setForeground(QColor(_TYPE_COLOR.get(field["type"], C_TX0)))
@@ -2336,8 +1589,9 @@ if not _needs_restart:
                 self.manage_category.setCurrentIndex(-1)
 
         def _manage_selected(self):
+            # Index the SORTED list — table rows map to _manage_rows.
             rows = self.tbl_manage.selectionModel().selectedRows()
-            return [self._fields[r.row()]["name"]
+            return [self._manage_rows[r.row()]["name"]
                     for r in sorted(rows, key=lambda x: x.row())]
 
         def _apply_category(self):
@@ -2383,12 +1637,6 @@ if not _needs_restart:
             if r["bindings_dropped"]:
                 self._mlog("Also removed %d binding(s) sourced from deleted "
                            "fields." % r["bindings_dropped"], C_TX2)
-            if r.get("events_dropped"):
-                self._mlog("Also removed %d MVVM event binding(s)."
-                           % r["events_dropped"], C_TX2)
-            if r.get("event_graphs_removed"):
-                self._mlog("Also removed %d event Function Graph(s)."
-                           % r["event_graphs_removed"], C_TX2)
             self._load()
 
         @staticmethod
@@ -2447,8 +1695,7 @@ if not _needs_restart:
         def _refresh_bulk_suggestions(self):
             """Fill both pattern dropdowns with families detected from real names."""
             self.field_pattern.clear()
-            for pat, _n in detect_patterns(
-                    [f["name"] for f in self._fields if f["type"] != "event"]):
+            for pat, _n in detect_patterns([f["name"] for f in self._fields]):
                 self.field_pattern.addItem(pat)
             self.widget_pattern.clear()
             names = ([w["name"] for w in self._widgets]
@@ -2555,7 +1802,6 @@ if not _needs_restart:
                 self._log("Load failed: %s" % exc, C_ERR)
                 return
             self._wbp_path, self._fields = path, fields
-            self._entries = entries
             self._widgets, self._child_widgets = widgets, children
             # Show just the widget name now that the full path is remembered.
             self.path_edit.setText(self._widget_name(path))
@@ -2570,7 +1816,6 @@ if not _needs_restart:
             self._refresh_category_filter()
             self._refresh_fields()
             self._refresh_targets()
-            self._refresh_events()
             self._refresh_manage()
 
         def _refresh_category_combo(self):
@@ -2605,12 +1850,34 @@ if not _needs_restart:
             self.category_filter.setCurrentIndex(idx if idx >= 0 else 0)
             self.category_filter.blockSignals(False)
 
+        @staticmethod
+        def _name_key(name):
+            """Natural sort key: VF_Slot2 before VF_Slot10, not after.
+
+            Plain alphabetical scatters numbered field families ("Slot10" < "Slot2"),
+            which is the exact layout this tool encourages.
+            """
+            return [int(t) if t.isdigit() else t.lower()
+                    for t in re.split(r"(\d+)", name)]
+
+        @classmethod
+        def _apply_sort(cls, fields, state):
+            """Order `fields` by name for the header's sort state.
+
+            Sorts the BACKING LIST, not the view — row index must keep mapping to
+            the same field, since bind/delete resolve targets by row.
+            """
+            if state == SORT_NONE:
+                return fields
+            return sorted(fields, key=lambda f: cls._name_key(f["name"]),
+                          reverse=(state == SORT_DESC))
+
         def _refresh_fields(self):
             cat = self.category_filter.currentText()
-            self._visible_fields = [
-                f for f in self._fields
-                if f["type"] != "event"
-                and (cat == "All" or f.get("category", "Default") == cat)]
+            self._visible_fields = [f for f in self._fields
+                                    if cat == "All" or f.get("category", "Default") == cat]
+            self._visible_fields = self._apply_sort(
+                self._visible_fields, self.fields_sort.state)
             self.tbl_fields.setRowCount(len(self._visible_fields))
             for r, field in enumerate(self._visible_fields):
                 self.tbl_fields.setItem(r, 0, QTableWidgetItem(field["name"]))
